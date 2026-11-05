@@ -29,11 +29,29 @@ interface Submission {
   assignment_id: string;
   student_id: string;
   content: string;
-  submitted_at: string;
+  submitted_at?: string;
+  created_at?: string;
   file_url?: string;
   file_name?: string;
   profiles?: { full_name: string };
 }
+
+const formatSubmissionDate = (createdAt?: string, submittedAt?: string) => {
+  const getValidDate = (str?: string) => {
+    if (!str) return null;
+    const d = new Date(str);
+    const time = d.getTime();
+    if (isNaN(time) || time < 946684800000) return null; // trước năm 2000 coi như không hợp lệ (1970 epoch)
+    return d;
+  };
+
+  const validD = getValidDate(createdAt) || getValidDate(submittedAt);
+  if (!validD) return 'Vừa xong';
+  return `${validD.toLocaleDateString('vi-VN')} ${validD.toLocaleTimeString('vi-VN', {
+    hour: '2-digit',
+    minute: '2-digit',
+  })}`;
+};
 
 export default function ClassroomDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const resolvedParams = use(params);
@@ -45,8 +63,12 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
   const [assignments, setAssignments] = useState<Assignment[]>([]);
   const [submissions, setSubmissions] = useState<Submission[]>([]);
   const [studentSubmissions, setStudentSubmissions] = useState<
-    Record<string, { file_name: string; file_url?: string; submitted_at: string; content?: string }>
+    Record<
+      string,
+      { id?: string; file_name: string; file_url?: string; submitted_at: string; content?: string }
+    >
   >({});
+  const [isDeletingSubId, setIsDeletingSubId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   // Form tạo bài (Giáo viên)
@@ -141,21 +163,27 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
     const loadedSubs = (subs as Submission[]) || [];
     setSubmissions(loadedSubs);
 
-    // Đồng bộ map bài nộp của học sinh hiện tại
+    // Đồng bộ map bài nộp của học sinh hiện tại (ưu tiên bản ghi mới nhất)
     const subRecord: Record<
       string,
-      { file_name: string; file_url?: string; submitted_at: string; content?: string }
+      { id?: string; file_name: string; file_url?: string; submitted_at: string; content?: string }
     > = {};
     loadedSubs.forEach((sub) => {
       if (sub.student_id === user.id) {
-        subRecord[sub.assignment_id] = {
-          file_name:
-            sub.file_name ||
-            (sub.content ? (sub.content.length > 30 ? sub.content.substring(0, 30) + '...' : sub.content) : 'Bài làm đã nộp'),
-          file_url: sub.file_url,
-          submitted_at: sub.submitted_at,
-          content: sub.content,
-        };
+        const existing = subRecord[sub.assignment_id];
+        const subTime = new Date(sub.created_at || sub.submitted_at || 0).getTime();
+        const existingTime = existing ? new Date(existing.submitted_at || 0).getTime() : -1;
+        if (!existing || subTime >= existingTime) {
+          subRecord[sub.assignment_id] = {
+            id: sub.id,
+            file_name:
+              sub.file_name ||
+              (sub.content ? (sub.content.length > 30 ? sub.content.substring(0, 30) + '...' : sub.content) : 'Bài làm đã nộp'),
+            file_url: sub.file_url,
+            submitted_at: sub.created_at || sub.submitted_at || new Date().toISOString(),
+            content: sub.content,
+          };
+        }
       }
     });
     setStudentSubmissions(subRecord);
@@ -239,6 +267,15 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
   };
 
   const handleSubmitWork = async (assignmentId: string) => {
+    // Quy định: Mỗi học sinh CHỈ ĐƯỢC nộp bài 1 lần cho mỗi bài tập
+    const existingSub = submissions.find(
+      (s) => s.assignment_id === assignmentId && s.student_id === currentUserId
+    );
+    if (existingSub || studentSubmissions[assignmentId]) {
+      alert('Mỗi học sinh chỉ được nộp bài 1 lần cho mỗi bài tập. Vui lòng xóa bài nộp cũ nếu muốn nộp lại!');
+      return;
+    }
+
     if (!submissionFile && !submissionContent.trim()) {
       alert('Vui lòng chọn file bài làm hoặc nhập câu trả lời!');
       return;
@@ -254,14 +291,6 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
       submissionContent.trim() ||
       (uploadedFileInfo ? `Đã nộp bài: ${uploadedFileInfo.name}` : 'Đã nộp bài tập');
 
-    // Kiểm tra và xoá bản ghi cũ nếu học sinh nộp lại
-    const existingSub = submissions.find(
-      (s) => s.assignment_id === assignmentId && s.student_id === currentUserId
-    );
-    if (existingSub) {
-      await supabase.from('submissions').delete().eq('id', existingSub.id);
-    }
-
     const payload: Record<string, unknown> = {
       assignment_id: assignmentId,
       student_id: currentUserId,
@@ -273,9 +302,19 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
       payload.file_name = uploadedFileInfo.name;
     }
 
-    let { error } = await supabase.from('submissions').insert([payload]);
+    // Xóa sạch bản ghi cũ (đề phòng còn sót) trước khi insert bài mới
+    await supabase
+      .from('submissions')
+      .delete()
+      .eq('assignment_id', assignmentId)
+      .eq('student_id', currentUserId);
+
+    const insertRes = await supabase.from('submissions').insert([payload]).select();
+    let error = insertRes.error;
+    const insertedData = insertRes.data;
 
     // Fallback nếu schema submissions chưa có cột file_url/file_name
+    let fallbackId = '';
     if (
       error &&
       (error.message.includes('column') ||
@@ -292,18 +331,21 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
         student_id: currentUserId,
         content: fallbackContent,
       };
-      const fallbackRes = await supabase.from('submissions').insert([fallbackPayload]);
+      const fallbackRes = await supabase.from('submissions').insert([fallbackPayload]).select();
       error = fallbackRes.error;
+      fallbackId = fallbackRes.data?.[0]?.id || '';
     }
 
     setIsSubmitting(false);
     if (error) {
       alert(`Lỗi nộp bài: ${error.message}`);
     } else {
+      const newSubmissionId = (insertedData && insertedData[0]?.id) || fallbackId || '';
       const submittedName = uploadedFileInfo?.name || submissionFile?.name || 'Bài làm đã nộp';
       setStudentSubmissions((prev) => ({
         ...prev,
         [assignmentId]: {
+          id: newSubmissionId,
           file_name: submittedName,
           file_url: uploadedFileInfo?.url,
           submitted_at: new Date().toISOString(),
@@ -316,6 +358,142 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
       setActiveSubmittingId(null);
       await fetchData();
       alert('Nộp bài thành công!');
+    }
+  };
+
+  const handleDeleteSubmission = async (
+    submissionId: string,
+    assignmentId: string,
+    filePath?: string
+  ) => {
+    const confirmed = window.confirm(
+      'Bạn có chắc chắn muốn xóa bài nộp này để nộp lại không? Dữ liệu bài làm cũ sẽ bị xóa hoàn toàn.'
+    );
+    if (!confirmed) return;
+
+    setIsDeletingSubId(assignmentId);
+
+    try {
+      // 1. Xóa file trên Storage nếu có
+      if (filePath) {
+        let storagePath = filePath;
+        if (storagePath.includes('/classroom-files/')) {
+          storagePath = storagePath.split('/classroom-files/')[1];
+        }
+        storagePath = storagePath.split('?')[0];
+        if (
+          storagePath &&
+          !storagePath.startsWith('blob:') &&
+          !storagePath.startsWith('http://') &&
+          !storagePath.startsWith('https://')
+        ) {
+          try {
+            await supabase.storage.from('classroom-files').remove([storagePath]);
+          } catch (storageErr) {
+            console.warn('Lỗi khi xóa file trên Storage:', storageErr);
+          }
+        }
+      }
+
+      // 2. Xóa triệt để TẤT CẢ các bản nộp của học sinh cho bài tập đó trên Supabase
+      const { error } = await supabase
+        .from('submissions')
+        .delete()
+        .eq('assignment_id', assignmentId)
+        .eq('student_id', currentUserId);
+
+      if (error) {
+        alert(`Lỗi khi xóa bài nộp: ${error.message}`);
+        setIsDeletingSubId(null);
+        return;
+      }
+
+      // 3. Cập nhật state nội bộ để bài tập chuyển về trạng thái Chưa nộp
+      setStudentSubmissions((prev) => {
+        const next = { ...prev };
+        delete next[assignmentId];
+        return next;
+      });
+
+      setSubmissions((prev) =>
+        prev.filter((s) => !(s.assignment_id === assignmentId && s.student_id === currentUserId))
+      );
+
+      // Đóng modal nộp bài nếu đang mở cho bài này
+      if (activeSubmittingId === assignmentId) {
+        setActiveSubmittingId(null);
+        setSubmissionFile(null);
+        setSubmissionContent('');
+      }
+
+      // 4. Đồng bộ lại dữ liệu toàn bộ trang
+      await fetchData();
+
+      alert('Đã xóa bài nộp thành công! Bạn có thể nộp bài tập mới ngay bây giờ.');
+    } catch (err) {
+      console.error('Lỗi khi xóa bài nộp:', err);
+      alert('Có lỗi xảy ra khi xóa bài nộp. Vui lòng thử lại!');
+    } finally {
+      setIsDeletingSubId(null);
+    }
+  };
+
+  const handleTeacherDeleteSubmission = async (
+    submissionId: string,
+    assignmentId: string,
+    studentId: string,
+    studentName: string,
+    filePath?: string
+  ) => {
+    const confirmed = window.confirm(
+      `Bạn có chắc chắn muốn xóa bài nộp của "${studentName}" không? Dữ liệu bài làm sẽ bị xóa hoàn toàn.`
+    );
+    if (!confirmed) return;
+
+    setIsDeletingSubId(submissionId);
+
+    try {
+      // 1. Xóa file trên Storage nếu có
+      if (filePath) {
+        let storagePath = filePath;
+        if (storagePath.includes('/classroom-files/')) {
+          storagePath = storagePath.split('/classroom-files/')[1];
+        }
+        storagePath = storagePath.split('?')[0];
+        if (
+          storagePath &&
+          !storagePath.startsWith('blob:') &&
+          !storagePath.startsWith('http://') &&
+          !storagePath.startsWith('https://')
+        ) {
+          try {
+            await supabase.storage.from('classroom-files').remove([storagePath]);
+          } catch (storageErr) {
+            console.warn('Lỗi khi xóa file trên Storage:', storageErr);
+          }
+        }
+      }
+
+      // 2. Xóa triệt để bản nộp của học sinh này trên bài tập
+      const { error } = await supabase
+        .from('submissions')
+        .delete()
+        .eq('assignment_id', assignmentId)
+        .eq('student_id', studentId);
+
+      if (error) {
+        alert(`Lỗi khi xóa bài nộp: ${error.message}`);
+        return;
+      }
+
+      // 3. Đồng bộ lại dữ liệu toàn bộ trang
+      await fetchData();
+      alert('Đã xóa bài nộp thành công!');
+    } catch (err) {
+      console.error('Lỗi khi xóa bài nộp của học sinh:', err);
+      alert('Có lỗi xảy ra khi xóa bài nộp. Vui lòng thử lại!');
+    } finally {
+      setIsDeletingSubId(null);
     }
   };
 
@@ -477,12 +655,37 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
               <div className="space-y-4">
                 {assignments.map((asm) => {
                   const assignmentSubs = submissions.filter((s) => s.assignment_id === asm.id);
+
+                  // Lọc deduplicate: Mỗi học sinh CHỈ HIỂN THỊ 1 BÀI NỘP DUY NHẤT (bản nộp mới nhất theo created_at hoặc submitted_at)
+                  const uniqueSubsMap = new Map<string, Submission>();
+                  assignmentSubs.forEach((sub) => {
+                    const existing = uniqueSubsMap.get(sub.student_id);
+                    if (!existing) {
+                      uniqueSubsMap.set(sub.student_id, sub);
+                    } else {
+                      const existingTime = new Date(existing.created_at || existing.submitted_at || 0).getTime();
+                      const newTime = new Date(sub.created_at || sub.submitted_at || 0).getTime();
+                      if (newTime > existingTime) {
+                        uniqueSubsMap.set(sub.student_id, sub);
+                      }
+                    }
+                  });
+                  const deduplicatedSubs = Array.from(uniqueSubsMap.values()).sort((a, b) => {
+                    const timeA = new Date(a.created_at || a.submitted_at || 0).getTime();
+                    const timeB = new Date(b.created_at || b.submitted_at || 0).getTime();
+                    return timeB - timeA;
+                  });
+
                   const mySub = assignmentSubs.find((s) => s.student_id === currentUserId);
                   const subRecord = studentSubmissions[asm.id];
                   const hasSubmitted = Boolean(mySub || subRecord);
+                  const currentSubId = mySub?.id || subRecord?.id || '';
                   const currentSubName = subRecord?.file_name || mySub?.file_name || mySub?.content;
-                  const currentSubUrl = subRecord?.file_url || mySub?.file_url;
-                  const currentSubDate = subRecord?.submitted_at || mySub?.submitted_at;
+                  const currentSubUrl =
+                    subRecord?.file_url ||
+                    mySub?.file_url ||
+                    (mySub?.content?.match(/\[File:.*?-\s*(https?:\/\/[^\s\]]+)\]/)?.[1] ?? undefined);
+                  const currentSubDate = subRecord?.submitted_at || mySub?.created_at || mySub?.submitted_at;
 
                   return (
                     <div
@@ -525,48 +728,97 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
                       {!isTeacher && (
                         <div className="pt-3 border-t border-slate-100">
                           {hasSubmitted ? (
-                            <div className="bg-emerald-50/90 border border-emerald-200 rounded-xl p-3.5 text-xs space-y-2">
-                              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                                <span className="inline-flex items-center gap-1.5 font-bold text-emerald-800">
-                                  <span className="w-2 h-2 rounded-full bg-emerald-500 inline-block"></span>
-                                  ✅ Đã nộp: {currentSubName || 'Bài làm đã nộp'}
-                                </span>
+                            <div className="bg-emerald-50/90 border border-emerald-200/90 rounded-xl p-4 text-xs space-y-3">
+                              {/* Header trạng thái & Nút Xóa bài nộp để nộp lại */}
+                              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 pb-2.5 border-b border-emerald-100">
                                 <div className="flex items-center gap-2">
-                                  {currentSubDate && (
-                                    <span className="text-[11px] text-emerald-600">
-                                      {new Date(currentSubDate).toLocaleDateString('vi-VN')} {new Date(currentSubDate).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' })}
-                                    </span>
+                                  <span className="flex h-2.5 w-2.5 relative">
+                                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                                    <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-600"></span>
+                                  </span>
+                                  <span className="font-bold text-emerald-900 text-xs">
+                                    Đã nộp bài (Mỗi học sinh chỉ nộp 1 lần)
+                                  </span>
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleDeleteSubmission(
+                                      currentSubId,
+                                      asm.id,
+                                      currentSubUrl
+                                    )
+                                  }
+                                  disabled={isDeletingSubId === asm.id}
+                                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white hover:bg-rose-50 text-rose-600 hover:text-rose-700 font-semibold border border-rose-200 hover:border-rose-300 rounded-lg transition text-xs shadow-2xs cursor-pointer disabled:opacity-50"
+                                  title="Xóa bài nộp cũ để được nộp lại"
+                                >
+                                  {isDeletingSubId === asm.id ? (
+                                    <>
+                                      <svg className="animate-spin h-3.5 w-3.5 text-rose-600" fill="none" viewBox="0 0 24 24">
+                                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+                                      </svg>
+                                      <span>Đang xóa bài...</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <svg className="w-3.5 h-3.5 text-rose-500 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                                      </svg>
+                                      <span>🗑️ Xóa bài nộp để nộp lại</span>
+                                    </>
                                   )}
-                                  <button
-                                    onClick={() => {
-                                      setActiveSubmittingId(asm.id);
-                                      setSubmissionContent(mySub?.content || subRecord?.content || '');
-                                      setSubmissionFile(null);
-                                    }}
-                                    className="px-2.5 py-1 bg-white hover:bg-emerald-100/70 text-emerald-700 font-semibold border border-emerald-300 rounded-md transition text-[11px] shadow-2xs"
-                                  >
-                                    🔄 Nộp lại
-                                  </button>
+                                </button>
+                              </div>
+
+                              {/* Thông tin chi tiết bài nộp */}
+                              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-slate-700 bg-white/90 p-3 rounded-lg border border-emerald-100/80">
+                                <div>
+                                  <span className="text-[11px] font-medium text-slate-500 block mb-0.5">Tên file đã nộp:</span>
+                                  <span className="font-semibold text-slate-800 text-xs break-all flex items-center gap-1.5">
+                                    <span>📄</span>
+                                    <span>{currentSubName || 'Bài làm đã nộp'}</span>
+                                  </span>
+                                </div>
+                                <div>
+                                  <span className="text-[11px] font-medium text-slate-500 block mb-0.5">Thời gian nộp:</span>
+                                  <span className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
+                                    <span>🕒</span>
+                                    <span>
+                                      {formatSubmissionDate(mySub?.created_at, currentSubDate)}
+                                    </span>
+                                  </span>
                                 </div>
                               </div>
 
+                              {/* Ghi chú thêm nếu có */}
                               {mySub?.content && mySub.content !== currentSubName && (
-                                <p className="text-slate-700 bg-white p-2 rounded-lg border border-emerald-100">
-                                  {mySub.content}
-                                </p>
+                                <div className="text-slate-700 bg-white/90 p-2.5 rounded-lg border border-emerald-100/80">
+                                  <span className="text-[11px] font-medium text-slate-500 block mb-0.5">Ghi chú bài nộp:</span>
+                                  <p className="text-xs text-slate-800 leading-relaxed whitespace-pre-wrap">{mySub.content}</p>
+                                </div>
                               )}
 
-                              {currentSubUrl && (
+                              {/* Nút xem/tải file đã nộp */}
+                              {currentSubUrl ? (
                                 <div className="pt-0.5">
                                   <a
                                     href={currentSubUrl}
                                     target="_blank"
                                     rel="noopener noreferrer"
                                     download={currentSubName || true}
-                                    className="inline-flex items-center gap-1.5 text-emerald-700 hover:text-emerald-900 font-semibold underline text-[11px]"
+                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-lg text-xs shadow-2xs transition"
                                   >
-                                    📎 Tải/Xem file bài nộp đã gửi ({currentSubName})
+                                    <svg className="w-3.5 h-3.5 text-white shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                                    </svg>
+                                    <span>Xem / Tải file đã nộp ({currentSubName || 'Tệp đính kèm'})</span>
                                   </a>
+                                </div>
+                              ) : (
+                                <div className="text-[11px] text-slate-500 italic">
+                                  (Bài nộp không có file đính kèm)
                                 </div>
                               )}
                             </div>
@@ -589,13 +841,13 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
                       {isTeacher && (
                         <div className="pt-3 border-t border-slate-100">
                           <p className="text-xs font-semibold text-slate-700 mb-2">
-                            Danh sách học sinh đã nộp ({assignmentSubs.length})
+                            Danh sách học sinh đã nộp ({deduplicatedSubs.length})
                           </p>
-                          {assignmentSubs.length === 0 ? (
+                          {deduplicatedSubs.length === 0 ? (
                             <p className="text-xs text-slate-400 italic">Chưa có học sinh nào nộp bài.</p>
                           ) : (
                             <div className="space-y-2">
-                              {assignmentSubs.map((sub) => (
+                              {deduplicatedSubs.map((sub) => (
                                 <div
                                   key={sub.id}
                                   className="bg-slate-50 border border-slate-200/80 rounded-xl p-3 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2"
@@ -606,7 +858,7 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
                                         {sub.profiles?.full_name || 'Học sinh'}
                                       </span>
                                       <span className="text-[10px] text-slate-400">
-                                        &bull; {new Date(sub.submitted_at).toLocaleDateString('vi-VN')} {new Date(sub.submitted_at).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' })}
+                                        &bull; {formatSubmissionDate(sub.created_at, sub.submitted_at)}
                                       </span>
                                     </div>
                                     {sub.content && (
@@ -625,6 +877,36 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
                                         </a>
                                       </div>
                                     )}
+                                  </div>
+
+                                  {/* Nút xóa bài nộp trực tiếp dành cho Giáo viên */}
+                                  <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        handleTeacherDeleteSubmission(
+                                          sub.id,
+                                          asm.id,
+                                          sub.student_id,
+                                          sub.profiles?.full_name || 'Học sinh',
+                                          sub.file_url
+                                        )
+                                      }
+                                      disabled={isDeletingSubId === sub.id}
+                                      className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-semibold text-rose-600 hover:text-rose-700 bg-white hover:bg-rose-50 border border-rose-200 hover:border-rose-300 rounded-lg transition disabled:opacity-50 cursor-pointer shadow-2xs"
+                                      title="Xóa bài nộp của học sinh này"
+                                    >
+                                      {isDeletingSubId === sub.id ? (
+                                        <span>Đang xóa...</span>
+                                      ) : (
+                                        <>
+                                          <svg className="w-3.5 h-3.5 text-rose-500 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                                          </svg>
+                                          <span>Xóa bài nộp</span>
+                                        </>
+                                      )}
+                                    </button>
                                   </div>
                                 </div>
                               ))}
@@ -648,7 +930,7 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
             <div className="flex items-start justify-between border-b border-slate-100 pb-3">
               <div>
                 <h3 className="text-sm font-bold text-slate-900">
-                  {studentSubmissions[activeSubmittingId] ? 'Nộp lại bài tập' : 'Nộp bài tập'}
+                  Nộp bài tập
                 </h3>
                 <p className="text-xs text-slate-500 mt-0.5 font-medium">
                   {assignments.find((a) => a.id === activeSubmittingId)?.title}
