@@ -53,6 +53,76 @@ const formatSubmissionDate = (createdAt?: string, submittedAt?: string) => {
   })}`;
 };
 
+const formatForDateTimeLocal = (dateStr?: string | null): string => {
+  if (!dateStr) return '';
+  const d = new Date(dateStr);
+  if (isNaN(d.getTime())) return '';
+  const pad = (n: number) => n.toString().padStart(2, '0');
+  const year = d.getFullYear();
+  const month = pad(d.getMonth() + 1);
+  const day = pad(d.getDate());
+  const hours = pad(d.getHours());
+  const minutes = pad(d.getMinutes());
+  return `${year}-${month}-${day}T${hours}:${minutes}`;
+};
+
+// Helper trích xuất tài liệu đính kèm (ưu tiên column -> regex description -> direct URL)
+const getAssignmentFile = (asm: Assignment): { url: string; name: string } | null => {
+  // 1. Ưu tiên file_url và file_name trên bản ghi
+  if (asm.file_url && !asm.file_url.startsWith('blob:')) {
+    return {
+      url: asm.file_url,
+      name: asm.file_name || 'Tài liệu đính kèm',
+    };
+  }
+
+  // 2. Quét trong description
+  if (asm.description) {
+    // Regex chuẩn: /(?:📎 Tài liệu đính kèm: |\[ATTACHMENT_FILE: )?([^(\n]+?)\s*\(((?:https?:\/\/|blob:)[^\s)]+)\)/
+    const match = asm.description.match(
+      /(?:📎 Tài liệu đính kèm:\s*|\[ATTACHMENT_FILE:\s*)?([^(\n]+?)\s*\(((?:https?:\/\/|blob:)[^\s)]+)\)/
+    );
+    if (match && match[2] && !match[2].startsWith('blob:')) {
+      const rawName = match[1]?.trim();
+      const cleanName = rawName ? rawName.replace(/^📎\s*(?:Tài liệu đính kèm:\s*)?/, '').trim() : '';
+      return {
+        url: match[2].trim(),
+        name: cleanName || 'Tài liệu đính kèm',
+      };
+    }
+
+    // Dự phòng dạng [File: fileName - url]
+    const fileTagMatch = asm.description.match(/\[File:\s*(.*?)\s*-\s*((?:https?:\/\/)[^\s\]]+)\]/);
+    if (fileTagMatch && fileTagMatch[2]) {
+      return {
+        url: fileTagMatch[2].trim(),
+        name: fileTagMatch[1]?.trim() || 'Tài liệu đính kèm',
+      };
+    }
+
+    // Dự phòng tìm URL trực tiếp trong description (loại trừ blob:)
+    const urlMatch = asm.description.match(/(https?:\/\/[^\s)<>]+)/);
+    if (urlMatch && !urlMatch[1].startsWith('blob:')) {
+      return {
+        url: urlMatch[1].trim(),
+        name: 'Tài liệu đính kèm',
+      };
+    }
+  }
+
+  return null;
+};
+
+// Làm sạch mô tả bài tập để chỉ hiển thị nội dung đẹp mắt cho người dùng
+const cleanAsmDescription = (desc?: string): string => {
+  if (!desc) return '';
+  return desc
+    .replace(/(?:📎 Tài liệu đính kèm:.*$|\[ATTACHMENT_FILE:.*?\]|\[File:.*?\])/gm, '')
+    .replace(/\s*\(((?:https?:\/\/|blob:)[^\s)]+)\)/g, '')
+    .replace(/(?:^|\n)\s*https?:\/\/[^\s)]+\s*(?:\n|$)/g, '\n')
+    .trim();
+};
+
 export default function ClassroomDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const resolvedParams = use(params);
   const classroomId = resolvedParams.id;
@@ -69,60 +139,47 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
     >
   >({});
   const [isDeletingSubId, setIsDeletingSubId] = useState<string | null>(null);
+  const [isDeletingAsmId, setIsDeletingAsmId] = useState<string | null>(null);
+  const [editingDueDateAsmId, setEditingDueDateAsmId] = useState<string | null>(null);
+  const [tempDueDate, setTempDueDate] = useState<string>('');
+  const [isUpdatingDueDate, setIsUpdatingDueDate] = useState(false);
   const [loading, setLoading] = useState(true);
 
   // Form tạo bài (Giáo viên)
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [dueDate, setDueDate] = useState('');
-  const [attachmentFile, setAttachmentFile] = useState<File | null>(null);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [isCreating, setIsCreating] = useState(false);
 
   // Form nộp bài (Học sinh)
   const [activeSubmittingId, setActiveSubmittingId] = useState<string | null>(null);
-  const [submissionFile, setSubmissionFile] = useState<File | null>(null);
+  const [selectedSubmissionFile, setSelectedSubmissionFile] = useState<File | null>(null);
   const [submissionContent, setSubmissionContent] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
 
-  // Hàm upload file lên Supabase Storage với fallback an toàn
-  const uploadFile = async (
+  // Hàm upload file trực tiếp lên Supabase Storage bucket 'classroom-files'
+  const uploadFileToSupabase = async (
     file: File,
     folder: string
-  ): Promise<{ url: string; name: string } | null> => {
-    try {
-      const cleanFileName = file.name.replace(/[^a-zA-Z0-9.-]/g, '_');
-      const filePath = `${folder}/${Date.now()}_${cleanFileName}`;
+  ): Promise<{ publicUrl: string; fileName: string }> => {
+    const cleanFileName = file.name.replace(/[^a-zA-Z0-9.-]/g, '_');
+    const filePath = `${folder}/${Date.now()}_${cleanFileName}`;
 
-      const { error: uploadError } = await supabase.storage
-        .from('classroom-files')
-        .upload(filePath, file, { cacheControl: '3600', upsert: true });
+    const { error: uploadError } = await supabase.storage
+      .from('classroom-files')
+      .upload(filePath, file, { cacheControl: '3600', upsert: true });
 
-      if (uploadError) {
-        console.warn('Supabase storage upload notice (falling back):', uploadError.message);
-        let fallbackUrl = '';
-        try {
-          fallbackUrl = URL.createObjectURL(file);
-        } catch {
-          fallbackUrl = '';
-        }
-        return {
-          url: fallbackUrl,
-          name: file.name,
-        };
-      }
-
-      const { data } = supabase.storage.from('classroom-files').getPublicUrl(filePath);
-      return {
-        url: data.publicUrl,
-        name: file.name,
-      };
-    } catch (err) {
-      console.warn('Storage upload exception:', err);
-      return {
-        url: '',
-        name: file.name,
-      };
+    if (uploadError) {
+      console.error('Supabase storage upload error:', uploadError.message);
+      throw new Error(`Tải tệp lên thất bại: ${uploadError.message}`);
     }
+
+    const { data } = supabase.storage.from('classroom-files').getPublicUrl(filePath);
+    return {
+      publicUrl: data.publicUrl,
+      fileName: file.name,
+    };
   };
 
   const fetchData = useCallback(async () => {
@@ -174,14 +231,21 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
         const subTime = new Date(sub.created_at || sub.submitted_at || 0).getTime();
         const existingTime = existing ? new Date(existing.submitted_at || 0).getTime() : -1;
         if (!existing || subTime >= existingTime) {
+          const cleanSubContent = sub.content ? sub.content.replace(/\[File:.*?\]/g, '').trim() : '';
+          const validFileUrl =
+            sub.file_url && !sub.file_url.startsWith('blob:')
+              ? sub.file_url
+              : (!sub.content?.includes('blob:') ? sub.content?.match(/\[File:.*?-\s*(https?:\/\/[^\s\]]+)\]/)?.[1] : undefined);
+          const embeddedFileName = sub.content?.match(/\[File:\s*(.*?)\s*-\s*https?:\/\/[^\s\]]+\]/)?.[1];
           subRecord[sub.assignment_id] = {
             id: sub.id,
             file_name:
               sub.file_name ||
-              (sub.content ? (sub.content.length > 30 ? sub.content.substring(0, 30) + '...' : sub.content) : 'Bài làm đã nộp'),
-            file_url: sub.file_url,
+              embeddedFileName ||
+              (cleanSubContent ? (cleanSubContent.length > 30 ? cleanSubContent.substring(0, 30) + '...' : cleanSubContent) : 'Bài làm đã nộp'),
+            file_url: validFileUrl,
             submitted_at: sub.created_at || sub.submitted_at || new Date().toISOString(),
-            content: sub.content,
+            content: cleanSubContent,
           };
         }
       }
@@ -213,56 +277,93 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
     e.preventDefault();
     setIsCreating(true);
 
-    let uploadedFileInfo: { url: string; name: string } | null = null;
-    if (attachmentFile) {
-      uploadedFileInfo = await uploadFile(attachmentFile, 'assignments');
-    }
+    try {
+      let fileUrl = '';
+      let fileName = '';
 
-    const payload: Record<string, unknown> = {
-      classroom_id: classroomId,
-      title,
-      description,
-      due_date: dueDate ? new Date(dueDate).toISOString() : null,
-    };
+      if (selectedFile) {
+        const uploadResult = await uploadFileToSupabase(selectedFile, 'assignments');
+        fileUrl = uploadResult.publicUrl;
+        fileName = uploadResult.fileName;
+      }
 
-    if (uploadedFileInfo) {
-      payload.file_url = uploadedFileInfo.url;
-      payload.file_name = uploadedFileInfo.name;
-    }
-
-    let { error } = await supabase.from('assignments').insert([payload]);
-
-    // Fallback nếu database schema chưa có cột file_url/file_name
-    if (
-      error &&
-      (error.message.includes('column') ||
-        error.code === 'PGRST204' ||
-        error.message.includes('file_url') ||
-        error.message.includes('file_name'))
-    ) {
-      const fallbackDesc = uploadedFileInfo
-        ? `${description}\n\n📎 Tài liệu đính kèm: ${uploadedFileInfo.name} (${uploadedFileInfo.url})`
-        : description;
-
-      const fallbackPayload = {
+      const basePayload: Record<string, unknown> = {
         classroom_id: classroomId,
         title,
-        description: fallbackDesc,
+        description,
         due_date: dueDate ? new Date(dueDate).toISOString() : null,
       };
-      const fallbackRes = await supabase.from('assignments').insert([fallbackPayload]);
-      error = fallbackRes.error;
-    }
 
-    setIsCreating(false);
-    if (error) {
-      alert(`Lỗi tạo bài tập: ${error.message}`);
-    } else {
-      setTitle('');
-      setDescription('');
-      setDueDate('');
-      setAttachmentFile(null);
-      await fetchData();
+      let error: { message: string; code?: string } | null = null;
+
+      if (!fileUrl) {
+        const res = await supabase.from('assignments').insert([basePayload]);
+        error = res.error;
+      } else {
+        // Tầng 1: Insert payload đầy đủ { file_url, file_name }
+        const tier1Payload: Record<string, unknown> = {
+          ...basePayload,
+          file_url: fileUrl,
+          file_name: fileName,
+        };
+        const res1 = await supabase.from('assignments').insert([tier1Payload]);
+        error = res1.error;
+
+        // Tầng 2: Nếu lỗi thiếu cột file_name, insert { file_url }
+        if (
+          error &&
+          !error.message?.includes('file_url') &&
+          (error.code === 'PGRST204' ||
+            error.message?.toLowerCase().includes('column') ||
+            error.message?.includes('file_name'))
+        ) {
+          console.warn('Assignments schema thiếu cột file_name, thử Tầng 2 chỉ lưu file_url');
+          const tier2Payload: Record<string, unknown> = {
+            ...basePayload,
+            file_url: fileUrl,
+          };
+          const res2 = await supabase.from('assignments').insert([tier2Payload]);
+          error = res2.error;
+        }
+
+        // Tầng 3: Nếu lỗi thiếu cột file_url, lưu link file và tên file vào description
+        // dạng: description + '\n📎 Tài liệu đính kèm: ' + fileName + ' (' + fileUrl + ')'
+        // và insert payload KHÔNG CÓ file_url/file_name. Đảm bảo 100% không bị chặn khi đăng bài!
+        if (
+          error &&
+          (error.code === 'PGRST204' ||
+            error.message?.toLowerCase().includes('column') ||
+            error.message?.includes('file_url') ||
+            error.message?.includes('file_name'))
+        ) {
+          console.warn('Assignments schema thiếu cột file_url/file_name, chuyển sang Tầng 3 lưu vào description');
+          const attachmentText = '\n📎 Tài liệu đính kèm: ' + fileName + ' (' + fileUrl + ')';
+          const tier3Description = description
+            ? description + attachmentText
+            : '📎 Tài liệu đính kèm: ' + fileName + ' (' + fileUrl + ')';
+          const tier3Payload: Record<string, unknown> = {
+            ...basePayload,
+            description: tier3Description,
+          };
+          const res3 = await supabase.from('assignments').insert([tier3Payload]);
+          error = res3.error;
+        }
+      }
+
+      if (error) {
+        alert(`Lỗi tạo bài tập: ${error.message}`);
+      } else {
+        setTitle('');
+        setDescription('');
+        setDueDate('');
+        setSelectedFile(null);
+        await fetchData();
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Có lỗi xảy ra khi tạo bài tập';
+      alert(msg);
+    } finally {
+      setIsCreating(false);
     }
   };
 
@@ -276,88 +377,123 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
       return;
     }
 
-    if (!submissionFile && !submissionContent.trim()) {
+    if (!selectedSubmissionFile && !submissionContent.trim()) {
       alert('Vui lòng chọn file bài làm hoặc nhập câu trả lời!');
       return;
     }
     setIsSubmitting(true);
 
-    let uploadedFileInfo: { url: string; name: string } | null = null;
-    if (submissionFile) {
-      uploadedFileInfo = await uploadFile(submissionFile, 'submissions');
-    }
+    try {
+      let fileUrl = '';
+      let fileName = '';
 
-    const contentText =
-      submissionContent.trim() ||
-      (uploadedFileInfo ? `Đã nộp bài: ${uploadedFileInfo.name}` : 'Đã nộp bài tập');
+      if (selectedSubmissionFile) {
+        const uploadResult = await uploadFileToSupabase(selectedSubmissionFile, 'submissions');
+        fileUrl = uploadResult.publicUrl;
+        fileName = uploadResult.fileName;
+      }
 
-    const payload: Record<string, unknown> = {
-      assignment_id: assignmentId,
-      student_id: currentUserId,
-      content: contentText,
-    };
+      const contentText = submissionContent.trim();
 
-    if (uploadedFileInfo) {
-      payload.file_url = uploadedFileInfo.url;
-      payload.file_name = uploadedFileInfo.name;
-    }
-
-    // Xóa sạch bản ghi cũ (đề phòng còn sót) trước khi insert bài mới
-    await supabase
-      .from('submissions')
-      .delete()
-      .eq('assignment_id', assignmentId)
-      .eq('student_id', currentUserId);
-
-    const insertRes = await supabase.from('submissions').insert([payload]).select();
-    let error = insertRes.error;
-    const insertedData = insertRes.data;
-
-    // Fallback nếu schema submissions chưa có cột file_url/file_name
-    let fallbackId = '';
-    if (
-      error &&
-      (error.message.includes('column') ||
-        error.code === 'PGRST204' ||
-        error.message.includes('file_url') ||
-        error.message.includes('file_name'))
-    ) {
-      const fallbackContent = uploadedFileInfo
-        ? `${contentText} [File: ${uploadedFileInfo.name} - ${uploadedFileInfo.url}]`
-        : contentText;
-
-      const fallbackPayload = {
+      const basePayload: Record<string, unknown> = {
         assignment_id: assignmentId,
         student_id: currentUserId,
-        content: fallbackContent,
+        content: contentText,
       };
-      const fallbackRes = await supabase.from('submissions').insert([fallbackPayload]).select();
-      error = fallbackRes.error;
-      fallbackId = fallbackRes.data?.[0]?.id || '';
-    }
 
-    setIsSubmitting(false);
-    if (error) {
-      alert(`Lỗi nộp bài: ${error.message}`);
-    } else {
-      const newSubmissionId = (insertedData && insertedData[0]?.id) || fallbackId || '';
-      const submittedName = uploadedFileInfo?.name || submissionFile?.name || 'Bài làm đã nộp';
-      setStudentSubmissions((prev) => ({
-        ...prev,
-        [assignmentId]: {
-          id: newSubmissionId,
-          file_name: submittedName,
-          file_url: uploadedFileInfo?.url,
-          submitted_at: new Date().toISOString(),
-          content: contentText,
-        },
-      }));
+      // Xóa sạch bản ghi cũ (đề phòng còn sót) trước khi insert bài mới
+      await supabase
+        .from('submissions')
+        .delete()
+        .eq('assignment_id', assignmentId)
+        .eq('student_id', currentUserId);
 
-      setSubmissionContent('');
-      setSubmissionFile(null);
-      setActiveSubmittingId(null);
-      await fetchData();
-      alert('Nộp bài thành công!');
+      let error: { message: string; code?: string } | null = null;
+      let insertedData: { id: string }[] | null = null;
+
+      if (!fileUrl) {
+        const res = await supabase.from('submissions').insert([basePayload]).select();
+        error = res.error;
+        insertedData = res.data;
+      } else {
+        // Tầng 1: Insert payload đầy đủ { file_url, file_name }
+        const tier1Payload: Record<string, unknown> = {
+          ...basePayload,
+          file_url: fileUrl,
+          file_name: fileName,
+        };
+        const res1 = await supabase.from('submissions').insert([tier1Payload]).select();
+        error = res1.error;
+        insertedData = res1.data;
+
+        // Tầng 2: Nếu lỗi thiếu cột file_name, insert { file_url }
+        if (
+          error &&
+          !error.message?.includes('file_url') &&
+          (error.code === 'PGRST204' ||
+            error.message?.toLowerCase().includes('column') ||
+            error.message?.includes('file_name'))
+        ) {
+          console.warn('Submissions schema thiếu cột file_name, thử Tầng 2 chỉ lưu file_url');
+          const tier2Payload: Record<string, unknown> = {
+            ...basePayload,
+            file_url: fileUrl,
+          };
+          const res2 = await supabase.from('submissions').insert([tier2Payload]).select();
+          error = res2.error;
+          insertedData = res2.data;
+        }
+
+        // Tầng 3: Nếu bảng submissions chưa có cột file_url/file_name thì lưu vào content dạng:
+        // contentText + ' [File: ' + fileName + ' - ' + fileUrl + ']'
+        // và insert payload KHÔNG CÓ file_url/file_name
+        if (
+          error &&
+          (error.code === 'PGRST204' ||
+            error.message?.toLowerCase().includes('column') ||
+            error.message?.includes('file_url') ||
+            error.message?.includes('file_name'))
+        ) {
+          console.warn('Submissions schema thiếu cột file_url/file_name, chuyển sang Tầng 3 lưu vào content');
+          const fileSuffix = ' [File: ' + fileName + ' - ' + fileUrl + ']';
+          const tier3Content = contentText ? contentText + fileSuffix : '[File: ' + fileName + ' - ' + fileUrl + ']';
+          const tier3Payload: Record<string, unknown> = {
+            ...basePayload,
+            content: tier3Content,
+          };
+          const res3 = await supabase.from('submissions').insert([tier3Payload]).select();
+          error = res3.error;
+          insertedData = res3.data;
+        }
+      }
+
+      if (error) {
+        alert(`Lỗi nộp bài: ${error.message}`);
+      } else {
+        const newSubmissionId = (insertedData && insertedData[0]?.id) || '';
+        const submittedName = fileName || selectedSubmissionFile?.name || 'Bài làm đã nộp';
+        setStudentSubmissions((prev) => ({
+          ...prev,
+          [assignmentId]: {
+            id: newSubmissionId,
+            file_name: submittedName,
+            file_url: fileUrl || undefined,
+            submitted_at: new Date().toISOString(),
+            content: contentText,
+          },
+        }));
+
+        setSubmissionContent('');
+        setSelectedSubmissionFile(null);
+        setActiveSubmittingId(null);
+        await fetchData();
+        alert('Nộp bài thành công!');
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Có lỗi xảy ra khi nộp bài';
+      alert(msg);
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -422,7 +558,7 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
       // Đóng modal nộp bài nếu đang mở cho bài này
       if (activeSubmittingId === assignmentId) {
         setActiveSubmittingId(null);
-        setSubmissionFile(null);
+        setSelectedSubmissionFile(null);
         setSubmissionContent('');
       }
 
@@ -494,6 +630,131 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
       alert('Có lỗi xảy ra khi xóa bài nộp. Vui lòng thử lại!');
     } finally {
       setIsDeletingSubId(null);
+    }
+  };
+
+  const removeStorageFile = async (filePath?: string) => {
+    if (!filePath) return;
+    let storagePath = filePath;
+    if (storagePath.includes('/classroom-files/')) {
+      storagePath = storagePath.split('/classroom-files/')[1];
+    }
+    storagePath = storagePath.split('?')[0];
+    if (
+      storagePath &&
+      !storagePath.startsWith('blob:') &&
+      !storagePath.startsWith('http://') &&
+      !storagePath.startsWith('https://')
+    ) {
+      try {
+        await supabase.storage.from('classroom-files').remove([storagePath]);
+      } catch (storageErr) {
+        console.warn('Lỗi khi xóa file trên Storage:', storageErr);
+      }
+    }
+  };
+
+  const handleDeleteAssignment = async (assignmentId: string) => {
+    const confirmed = window.confirm(
+      'Bạn có chắc chắn muốn xóa bài tập này không? Mọi bài nộp của học sinh cho bài này cũng sẽ bị xóa.'
+    );
+    if (!confirmed) return;
+
+    setIsDeletingAsmId(assignmentId);
+
+    try {
+      // 1. Xóa file đính kèm trên Storage (nếu có)
+      const targetAsm = assignments.find((a) => a.id === assignmentId);
+      const asmFile = targetAsm ? getAssignmentFile(targetAsm) : null;
+      await removeStorageFile(asmFile?.url || targetAsm?.file_url);
+
+      // Xóa file đính kèm của các bài nộp thuộc bài tập này (nếu có)
+      const relatedSubs = submissions.filter((s) => s.assignment_id === assignmentId);
+      for (const sub of relatedSubs) {
+        const subFileUrl =
+          sub.file_url ||
+          sub.content?.match(/\[File:.*?-\s*(https?:\/\/[^\s\]]+)\]/)?.[1];
+        await removeStorageFile(subFileUrl);
+      }
+
+      // 2. Xóa các bản nộp thuộc bài tập trong bảng submissions
+      const { error: subDeleteError } = await supabase
+        .from('submissions')
+        .delete()
+        .eq('assignment_id', assignmentId);
+
+      if (subDeleteError) {
+        console.warn('Lỗi khi xóa submissions:', subDeleteError.message);
+      }
+
+      // 3. Xóa bài tập trong bảng assignments
+      const { error: asmDeleteError } = await supabase
+        .from('assignments')
+        .delete()
+        .eq('id', assignmentId);
+
+      if (asmDeleteError) {
+        alert(`Lỗi khi xóa bài tập: ${asmDeleteError.message}`);
+        return;
+      }
+
+      // 4. Cập nhật state nội bộ
+      setAssignments((prev) => prev.filter((a) => a.id !== assignmentId));
+      setSubmissions((prev) => prev.filter((s) => s.assignment_id !== assignmentId));
+      setStudentSubmissions((prev) => {
+        const next = { ...prev };
+        delete next[assignmentId];
+        return next;
+      });
+
+      if (activeSubmittingId === assignmentId) {
+        setActiveSubmittingId(null);
+      }
+      if (editingDueDateAsmId === assignmentId) {
+        setEditingDueDateAsmId(null);
+        setTempDueDate('');
+      }
+
+      // 5. Đồng bộ lại toàn bộ trang
+      await fetchData();
+      alert('Đã xóa bài tập thành công!');
+    } catch (err) {
+      console.error('Lỗi khi xóa bài tập:', err);
+      alert('Có lỗi xảy ra khi xóa bài tập. Vui lòng thử lại!');
+    } finally {
+      setIsDeletingAsmId(null);
+    }
+  };
+
+  const handleUpdateDueDate = async (assignmentId: string) => {
+    setIsUpdatingDueDate(true);
+    try {
+      const newDueDateIso = tempDueDate ? new Date(tempDueDate).toISOString() : null;
+
+      const { error } = await supabase
+        .from('assignments')
+        .update({ due_date: newDueDateIso })
+        .eq('id', assignmentId);
+
+      if (error) {
+        alert(`Lỗi khi cập nhật hạn nộp: ${error.message}`);
+        return;
+      }
+
+      setAssignments((prev) =>
+        prev.map((a) => (a.id === assignmentId ? { ...a, due_date: newDueDateIso } : a))
+      );
+
+      setEditingDueDateAsmId(null);
+      setTempDueDate('');
+
+      await fetchData();
+      alert('Đã cập nhật hạn nộp thành công!');
+    } catch (err) {
+      console.error('Lỗi khi cập nhật hạn nộp:', err);
+      alert('Có lỗi xảy ra khi cập nhật hạn nộp. Vui lòng thử lại!');
+    } finally {
+      setIsUpdatingDueDate(false);
     }
   };
 
@@ -602,23 +863,23 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
                         <svg className="w-4 h-4 text-slate-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
                         </svg>
-                        <span className="truncate">{attachmentFile ? 'Đổi file khác' : 'Chọn tệp (PDF, Word, Ảnh...)'}</span>
+                        <span className="truncate">{selectedFile ? 'Đổi file khác' : 'Chọn tệp (PDF, Word, Ảnh...)'}</span>
                         <input
                           type="file"
                           className="hidden"
                           onChange={(e) => {
                             if (e.target.files && e.target.files[0]) {
-                              setAttachmentFile(e.target.files[0]);
+                              setSelectedFile(e.target.files[0]);
                             }
                           }}
                         />
                       </label>
-                      {attachmentFile && (
+                      {selectedFile && (
                         <div className="flex items-center justify-between px-2.5 py-1.5 bg-indigo-50 border border-indigo-100 rounded-lg text-xs text-indigo-700">
-                          <span className="truncate max-w-[180px] font-medium">📎 {attachmentFile.name}</span>
+                          <span className="truncate max-w-[180px] font-medium">📎 {selectedFile.name}</span>
                           <button
                             type="button"
-                            onClick={() => setAttachmentFile(null)}
+                            onClick={() => setSelectedFile(null)}
                             className="text-indigo-400 hover:text-indigo-700 font-bold ml-1 text-sm"
                             title="Xoá file"
                           >
@@ -680,49 +941,133 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
                   const subRecord = studentSubmissions[asm.id];
                   const hasSubmitted = Boolean(mySub || subRecord);
                   const currentSubId = mySub?.id || subRecord?.id || '';
-                  const currentSubName = subRecord?.file_name || mySub?.file_name || mySub?.content;
+                  const cleanMySubContent = mySub?.content ? mySub.content.replace(/\[File:.*?\]/g, '').trim() : '';
+                  const mySubEmbeddedFileName = mySub?.content?.match(/\[File:\s*(.*?)\s*-\s*https?:\/\/[^\s\]]+\]/)?.[1];
+                  const currentSubName = subRecord?.file_name || mySub?.file_name || mySubEmbeddedFileName || cleanMySubContent || 'Bài làm đã nộp';
                   const currentSubUrl =
-                    subRecord?.file_url ||
-                    mySub?.file_url ||
-                    (mySub?.content?.match(/\[File:.*?-\s*(https?:\/\/[^\s\]]+)\]/)?.[1] ?? undefined);
+                    (subRecord?.file_url && !subRecord.file_url.startsWith('blob:') ? subRecord.file_url : undefined) ||
+                    (mySub?.file_url && !mySub.file_url.startsWith('blob:') ? mySub.file_url : undefined) ||
+                    (!mySub?.content?.includes('blob:') ? mySub?.content?.match(/\[File:.*?-\s*(https?:\/\/[^\s\]]+)\]/)?.[1] : undefined);
                   const currentSubDate = subRecord?.submitted_at || mySub?.created_at || mySub?.submitted_at;
+                  const displayAsmDescription = cleanAsmDescription(asm.description);
 
                   return (
                     <div
                       key={asm.id}
                       className="bg-white border border-slate-200/80 rounded-2xl p-5 shadow-sm space-y-4"
                     >
-                      <div className="flex items-start justify-between gap-4">
-                        <div>
+                      <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
+                        <div className="flex-1 min-w-0">
                           <h3 className="text-sm font-bold text-slate-900">{asm.title}</h3>
                           <p className="text-xs text-slate-600 mt-1 whitespace-pre-line leading-relaxed">
-                            {asm.description || 'Không có mô tả thêm.'}
+                            {displayAsmDescription || 'Không có mô tả thêm.'}
                           </p>
+                          {(() => {
+                            const fileInfo = getAssignmentFile(asm);
+                            if (!fileInfo) return null;
+                            return (
+                              <a
+                                href={fileInfo.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo-600 hover:text-indigo-800 bg-indigo-50 px-2.5 py-1 rounded-md mt-2 w-fit"
+                              >
+                                📎 Xem / Tải tài liệu đính kèm ({fileInfo.name})
+                              </a>
+                            );
+                          })()}
                         </div>
-                        {asm.due_date && (
-                          <span className="text-[11px] font-medium text-amber-700 bg-amber-50 px-2.5 py-0.5 rounded-md border border-amber-200/70 shrink-0">
-                            Hạn: {new Date(asm.due_date).toLocaleDateString('vi-VN')} {new Date(asm.due_date).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' })}
-                          </span>
-                        )}
-                      </div>
 
-                      {/* Nút / Badge tải tài liệu đính kèm của giáo viên nếu có */}
-                      {(asm.file_url || asm.file_name) && (
-                        <div className="pt-1">
-                          <a
-                            href={asm.file_url || '#'}
-                            target={asm.file_url ? '_blank' : undefined}
-                            rel="noopener noreferrer"
-                            download={asm.file_name || true}
-                            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200/80 rounded-lg transition"
-                          >
-                            <svg className="w-3.5 h-3.5 text-indigo-600 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                            </svg>
-                            <span>📎 Tải tài liệu đính kèm: <strong>{asm.file_name || 'Tài liệu bài tập'}</strong></span>
-                          </a>
+                        <div className="flex flex-col items-start sm:items-end gap-2.5 shrink-0">
+                          {isTeacher && (
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteAssignment(asm.id)}
+                              disabled={isDeletingAsmId === asm.id}
+                              className="inline-flex items-center gap-1.5 text-rose-600 hover:bg-rose-50 border border-rose-200 rounded-lg px-2.5 py-1 text-xs font-semibold transition cursor-pointer disabled:opacity-50"
+                              title="Xóa bài tập này"
+                            >
+                              {isDeletingAsmId === asm.id ? (
+                                <>
+                                  <svg className="animate-spin h-3.5 w-3.5 text-rose-600" fill="none" viewBox="0 0 24 24">
+                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+                                  </svg>
+                                  <span>Đang xóa...</span>
+                                </>
+                              ) : (
+                                <>
+                                  <svg className="w-3.5 h-3.5 text-rose-500 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                                  </svg>
+                                  <span>Xóa</span>
+                                </>
+                              )}
+                            </button>
+                          )}
+
+                          {isTeacher ? (
+                            editingDueDateAsmId === asm.id ? (
+                              <div className="flex flex-wrap items-center gap-1.5 bg-slate-50 p-2 rounded-xl border border-slate-200">
+                                <input
+                                  type="datetime-local"
+                                  value={tempDueDate}
+                                  onChange={(e) => setTempDueDate(e.target.value)}
+                                  className="text-xs px-2 py-1 bg-white border border-slate-300 rounded-md focus:outline-hidden focus:ring-1 focus:ring-indigo-500 text-slate-800"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => handleUpdateDueDate(asm.id)}
+                                  disabled={isUpdatingDueDate}
+                                  className="px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold rounded-md transition cursor-pointer disabled:opacity-50"
+                                >
+                                  {isUpdatingDueDate ? 'Lưu...' : 'Lưu'}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setEditingDueDateAsmId(null);
+                                    setTempDueDate('');
+                                  }}
+                                  disabled={isUpdatingDueDate}
+                                  className="px-2 py-1 bg-white hover:bg-slate-100 text-slate-600 text-xs font-medium border border-slate-200 rounded-md transition cursor-pointer"
+                                >
+                                  Hủy
+                                </button>
+                              </div>
+                            ) : (
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                {asm.due_date ? (
+                                  <span className="text-[11px] font-medium text-amber-700 bg-amber-50 px-2.5 py-0.5 rounded-md border border-amber-200/70 shrink-0">
+                                    Hạn: {new Date(asm.due_date).toLocaleDateString('vi-VN')} {new Date(asm.due_date).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' })}
+                                  </span>
+                                ) : (
+                                  <span className="text-[11px] font-medium text-slate-500 bg-slate-100 px-2.5 py-0.5 rounded-md border border-slate-200 shrink-0">
+                                    Chưa có hạn nộp
+                                  </span>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setEditingDueDateAsmId(asm.id);
+                                    setTempDueDate(formatForDateTimeLocal(asm.due_date));
+                                  }}
+                                  className="text-[11px] font-semibold text-indigo-600 hover:text-indigo-800 hover:bg-indigo-50 border border-indigo-200 px-2 py-0.5 rounded-md transition cursor-pointer"
+                                  title="Đổi hạn nộp"
+                                >
+                                  chỉnh sửa
+                                </button>
+                              </div>
+                            )
+                          ) : (
+                            asm.due_date && (
+                              <span className="text-[11px] font-medium text-amber-700 bg-amber-50 px-2.5 py-0.5 rounded-md border border-amber-200/70 shrink-0">
+                                Hạn: {new Date(asm.due_date).toLocaleDateString('vi-VN')} {new Date(asm.due_date).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' })}
+                              </span>
+                            )
+                          )}
                         </div>
-                      )}
+                      </div>
 
                       {/* Khu vực Học sinh nộp bài */}
                       {!isTeacher && (
@@ -793,27 +1138,26 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
                               </div>
 
                               {/* Ghi chú thêm nếu có */}
-                              {mySub?.content && mySub.content !== currentSubName && (
+                              {cleanMySubContent && cleanMySubContent !== currentSubName && (
                                 <div className="text-slate-700 bg-white/90 p-2.5 rounded-lg border border-emerald-100/80">
                                   <span className="text-[11px] font-medium text-slate-500 block mb-0.5">Ghi chú bài nộp:</span>
-                                  <p className="text-xs text-slate-800 leading-relaxed whitespace-pre-wrap">{mySub.content}</p>
+                                  <p className="text-xs text-slate-800 leading-relaxed whitespace-pre-wrap">{cleanMySubContent}</p>
                                 </div>
                               )}
 
-                              {/* Nút xem/tải file đã nộp */}
+                              {/* Nút xem/tải bài nộp */}
                               {currentSubUrl ? (
                                 <div className="pt-0.5">
                                   <a
                                     href={currentSubUrl}
                                     target="_blank"
                                     rel="noopener noreferrer"
-                                    download={currentSubName || true}
                                     className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-lg text-xs shadow-2xs transition"
                                   >
                                     <svg className="w-3.5 h-3.5 text-white shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                                     </svg>
-                                    <span>Xem / Tải file đã nộp ({currentSubName || 'Tệp đính kèm'})</span>
+                                    <span>📎 Xem / Tải bài nộp ({currentSubName || 'Tệp đính kèm'})</span>
                                   </a>
                                 </div>
                               ) : (
@@ -827,7 +1171,7 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
                               onClick={() => {
                                 setActiveSubmittingId(asm.id);
                                 setSubmissionContent('');
-                                setSubmissionFile(null);
+                                setSelectedSubmissionFile(null);
                               }}
                               className="inline-flex items-center gap-2 px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold rounded-lg shadow-sm transition"
                             >
@@ -847,69 +1191,77 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
                             <p className="text-xs text-slate-400 italic">Chưa có học sinh nào nộp bài.</p>
                           ) : (
                             <div className="space-y-2">
-                              {deduplicatedSubs.map((sub) => (
-                                <div
-                                  key={sub.id}
-                                  className="bg-slate-50 border border-slate-200/80 rounded-xl p-3 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2"
-                                >
-                                  <div className="space-y-1">
-                                    <div className="flex items-center gap-1.5">
-                                      <span className="font-bold text-slate-800">
-                                        {sub.profiles?.full_name || 'Học sinh'}
-                                      </span>
-                                      <span className="text-[10px] text-slate-400">
-                                        &bull; {formatSubmissionDate(sub.created_at, sub.submitted_at)}
-                                      </span>
-                                    </div>
-                                    {sub.content && (
-                                      <p className="text-slate-600 text-[11px] leading-relaxed">{sub.content}</p>
-                                    )}
-                                    {(sub.file_url || sub.file_name) && (
-                                      <div className="pt-0.5">
-                                        <a
-                                          href={sub.file_url || '#'}
-                                          target={sub.file_url ? '_blank' : undefined}
-                                          rel="noopener noreferrer"
-                                          download={sub.file_name || true}
-                                          className="inline-flex items-center gap-1 text-[11px] font-semibold text-indigo-600 hover:text-indigo-800 hover:underline"
-                                        >
-                                          📎 Tải bài nộp: <strong>{sub.file_name || 'Tệp bài làm'}</strong>
-                                        </a>
+                              {deduplicatedSubs.map((sub) => {
+                                const cleanContent = sub.content?.replace(/\[File:.*?\]/g, '').trim();
+                                const subFileUrl =
+                                  (sub.file_url && !sub.file_url.startsWith('blob:') ? sub.file_url : undefined) ||
+                                  (!sub.content?.includes('blob:') ? sub.content?.match(/\[File:.*?-\s*(https?:\/\/[^\s\]]+)\]/)?.[1] : undefined);
+                                const subFileName =
+                                  sub.file_name ||
+                                  sub.content?.match(/\[File:\s*(.*?)\s*-\s*https?:\/\/[^\s\]]+\]/)?.[1];
+                                return (
+                                  <div
+                                    key={sub.id}
+                                    className="bg-slate-50 border border-slate-200/80 rounded-xl p-3 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2"
+                                  >
+                                    <div className="space-y-1">
+                                      <div className="flex items-center gap-1.5">
+                                        <span className="font-bold text-slate-800">
+                                          {sub.profiles?.full_name || 'Học sinh'}
+                                        </span>
+                                        <span className="text-[10px] text-slate-400">
+                                          &bull; {formatSubmissionDate(sub.created_at, sub.submitted_at)}
+                                        </span>
                                       </div>
-                                    )}
-                                  </div>
-
-                                  {/* Nút xóa bài nộp trực tiếp dành cho Giáo viên */}
-                                  <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        handleTeacherDeleteSubmission(
-                                          sub.id,
-                                          asm.id,
-                                          sub.student_id,
-                                          sub.profiles?.full_name || 'Học sinh',
-                                          sub.file_url
-                                        )
-                                      }
-                                      disabled={isDeletingSubId === sub.id}
-                                      className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-semibold text-rose-600 hover:text-rose-700 bg-white hover:bg-rose-50 border border-rose-200 hover:border-rose-300 rounded-lg transition disabled:opacity-50 cursor-pointer shadow-2xs"
-                                      title="Xóa bài nộp của học sinh này"
-                                    >
-                                      {isDeletingSubId === sub.id ? (
-                                        <span>Đang xóa...</span>
-                                      ) : (
-                                        <>
-                                          <svg className="w-3.5 h-3.5 text-rose-500 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                                          </svg>
-                                          <span>Xóa bài nộp</span>
-                                        </>
+                                      {cleanContent && (
+                                        <p className="text-slate-600 text-[11px] leading-relaxed whitespace-pre-line">{cleanContent}</p>
                                       )}
-                                    </button>
+                                      {subFileUrl && (
+                                        <div className="pt-1">
+                                          <a
+                                            href={subFileUrl}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold text-indigo-600 hover:text-indigo-800 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200/70 rounded-md transition w-fit"
+                                          >
+                                            📎 Xem / Tải bài nộp {subFileName ? `(${subFileName})` : ''}
+                                          </a>
+                                        </div>
+                                      )}
+                                    </div>
+
+                                    {/* Nút xóa bài nộp trực tiếp dành cho Giáo viên */}
+                                    <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          handleTeacherDeleteSubmission(
+                                            sub.id,
+                                            asm.id,
+                                            sub.student_id,
+                                            sub.profiles?.full_name || 'Học sinh',
+                                            subFileUrl
+                                          )
+                                        }
+                                        disabled={isDeletingSubId === sub.id}
+                                        className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-semibold text-rose-600 hover:text-rose-700 bg-white hover:bg-rose-50 border border-rose-200 hover:border-rose-300 rounded-lg transition disabled:opacity-50 cursor-pointer shadow-2xs"
+                                        title="Xóa bài nộp của học sinh này"
+                                      >
+                                        {isDeletingSubId === sub.id ? (
+                                          <span>Đang xóa...</span>
+                                        ) : (
+                                          <>
+                                            <svg className="w-3.5 h-3.5 text-rose-500 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                                            </svg>
+                                            <span>Xóa bài nộp</span>
+                                          </>
+                                        )}
+                                      </button>
+                                    </div>
                                   </div>
-                                </div>
-                              ))}
+                                );
+                              })}
                             </div>
                           )}
                         </div>
@@ -940,7 +1292,7 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
                 type="button"
                 onClick={() => {
                   setActiveSubmittingId(null);
-                  setSubmissionFile(null);
+                  setSelectedSubmissionFile(null);
                   setSubmissionContent('');
                 }}
                 className="text-slate-400 hover:text-slate-600 text-base font-bold p-1 leading-none"
@@ -959,7 +1311,7 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
                   </svg>
                   <span className="text-xs font-semibold text-slate-700">
-                    {submissionFile ? 'Đổi file khác' : 'Nhấn để chọn file bài làm từ máy tính'}
+                    {selectedSubmissionFile ? 'Đổi file khác' : 'Nhấn để chọn file bài làm từ máy tính'}
                   </span>
                   <span className="text-[11px] text-slate-400 mt-1">Hỗ trợ các định dạng PDF, DOCX, PNG, JPG, ZIP</span>
                   <input
@@ -967,24 +1319,24 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
                     className="hidden"
                     onChange={(e) => {
                       if (e.target.files && e.target.files[0]) {
-                        setSubmissionFile(e.target.files[0]);
+                        setSelectedSubmissionFile(e.target.files[0]);
                       }
                     }}
                   />
                 </label>
 
-                {submissionFile && (
+                {selectedSubmissionFile && (
                   <div className="mt-2 flex items-center justify-between p-2.5 bg-indigo-50 border border-indigo-100 rounded-lg text-xs text-indigo-700">
                     <div className="flex items-center gap-2 truncate">
                       <span>📄</span>
-                      <span className="font-semibold truncate">{submissionFile.name}</span>
+                      <span className="font-semibold truncate">{selectedSubmissionFile.name}</span>
                       <span className="text-[10px] text-indigo-500">
-                        ({(submissionFile.size / 1024).toFixed(1)} KB)
+                        ({(selectedSubmissionFile.size / 1024).toFixed(1)} KB)
                       </span>
                     </div>
                     <button
                       type="button"
-                      onClick={() => setSubmissionFile(null)}
+                      onClick={() => setSelectedSubmissionFile(null)}
                       className="text-indigo-400 hover:text-indigo-700 font-bold ml-2 text-sm"
                       title="Gỡ file"
                     >
@@ -1013,7 +1365,7 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
                 type="button"
                 onClick={() => {
                   setActiveSubmittingId(null);
-                  setSubmissionFile(null);
+                  setSelectedSubmissionFile(null);
                   setSubmissionContent('');
                 }}
                 disabled={isSubmitting}

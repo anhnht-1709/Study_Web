@@ -63,8 +63,13 @@ CREATE TABLE IF NOT EXISTS public.assignments (
   title TEXT NOT NULL,
   description TEXT,
   due_date TIMESTAMPTZ,
+  file_url TEXT,
   created_at TIMESTAMPTZ DEFAULT now()
 );
+
+-- Đảm bảo cột file_url tồn tại nếu bảng đã được tạo từ trước
+ALTER TABLE public.assignments ADD COLUMN IF NOT EXISTS file_url TEXT;
+ALTER TABLE public.submissions ADD COLUMN IF NOT EXISTS file_url TEXT;
 
 -- 5. BẢNG BÀI NỘP (SUBMISSIONS)
 CREATE TABLE IF NOT EXISTS public.submissions (
