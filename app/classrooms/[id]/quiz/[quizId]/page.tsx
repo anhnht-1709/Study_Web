@@ -22,6 +22,24 @@ interface QuizQuestion {
   correct_index: number;
 }
 
+interface ShuffledOption {
+  originalIndex: number;
+  text: string;
+}
+
+interface DisplayQuestion extends QuizQuestion {
+  shuffledOptions: ShuffledOption[];
+}
+
+function shuffleArray<T>(array: T[]): T[] {
+  const shuffled = [...array];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled;
+}
+
 interface QuizSubmission {
   id?: string;
   quiz_id: string;
@@ -47,7 +65,7 @@ export default function TakeQuizPage({
 
   const [currentUserId, setCurrentUserId] = useState<string>('');
   const [quiz, setQuiz] = useState<Quiz | null>(null);
-  const [questions, setQuestions] = useState<QuizQuestion[]>([]);
+  const [questions, setQuestions] = useState<DisplayQuestion[]>([]);
   const [userAnswers, setUserAnswers] = useState<Record<string, number>>({});
   const [isSubmitted, setIsSubmitted] = useState<boolean>(false);
   const [submittedResult, setSubmittedResult] = useState<{
@@ -162,7 +180,7 @@ export default function TakeQuizPage({
 
   // Tải dữ liệu ban đầu
   useEffect(() => {
-    const fetchData = async () => {
+    const fetchQuizData = async () => {
       setLoading(true);
       setErrorMessage(null);
 
@@ -208,7 +226,11 @@ export default function TakeQuizPage({
           loadedQuestions = quizData.questions as QuizQuestion[];
         }
 
-        setQuestions(loadedQuestions);
+        // Đảm bảo mỗi câu hỏi có id xác định
+        const normalizedQuestions: QuizQuestion[] = loadedQuestions.map((q, idx) => ({
+          ...q,
+          id: q.id !== undefined && q.id !== null ? q.id : `q_${idx}`,
+        }));
 
         // 4. Kiểm tra bài nộp cũ trong quiz_submissions
         const { data: subData, error: subError } = await supabase
@@ -224,11 +246,22 @@ export default function TakeQuizPage({
           const submission = subData as QuizSubmission;
           setIsSubmitted(true);
 
+          // Bài đã nộp: ánh xạ options sang shuffledOptions giữ nguyên thứ tự hiển thị để xem lại
+          const preparedQuestions: DisplayQuestion[] = normalizedQuestions.map((q) => ({
+            ...q,
+            shuffledOptions: (q.options || []).map((text, idx) => ({
+              originalIndex: idx,
+              text,
+            })),
+          }));
+
+          setQuestions(preparedQuestions);
+
           let correctCount = submission.correct_count ?? 0;
           if (submission.correct_count === null || submission.correct_count === undefined) {
             // Tự tính lại nếu chưa lưu trường correct_count
             const subAnswers = submission.answers || {};
-            correctCount = loadedQuestions.filter((q, idx) => {
+            correctCount = preparedQuestions.filter((q, idx) => {
               const qKey = String(q.id || idx);
               return subAnswers[qKey] === q.correct_index;
             }).length;
@@ -237,7 +270,7 @@ export default function TakeQuizPage({
           setSubmittedResult({
             score: submission.score,
             correctCount,
-            totalQuestions: loadedQuestions.length,
+            totalQuestions: preparedQuestions.length,
             submittedAt: submission.submitted_at,
           });
 
@@ -245,7 +278,20 @@ export default function TakeQuizPage({
             setUserAnswers(submission.answers);
           }
         } else {
-          // Chưa nộp: Thiết lập thời gian đếm ngược
+          // Chưa nộp: Xáo trộn danh sách câu hỏi và danh sách lựa chọn của từng câu hỏi
+          const shuffledQuestions: DisplayQuestion[] = shuffleArray(normalizedQuestions).map((q) => ({
+            ...q,
+            shuffledOptions: shuffleArray(
+              (q.options || []).map((text, idx) => ({
+                originalIndex: idx,
+                text,
+              }))
+            ),
+          }));
+
+          setQuestions(shuffledQuestions);
+
+          // Thiết lập thời gian đếm ngược
           const limitMinutes = Number(quizData.time_limit_minutes) || 15;
           setTimeLeft(limitMinutes * 60);
         }
@@ -257,7 +303,7 @@ export default function TakeQuizPage({
       }
     };
 
-    fetchData();
+    fetchQuizData();
   }, [quizId, router]);
 
   // Bộ đếm ngược thời gian
@@ -298,11 +344,11 @@ export default function TakeQuizPage({
     return `${pad(m)}:${pad(s)}`;
   };
 
-  const handleSelectOption = (questionKey: string, optionIndex: number) => {
+  const handleSelectOption = (questionKey: string, optionOriginalIndex: number) => {
     if (isSubmitted) return;
     setUserAnswers((prev) => ({
       ...prev,
-      [questionKey]: optionIndex,
+      [questionKey]: optionOriginalIndex,
     }));
   };
 
@@ -591,9 +637,9 @@ export default function TakeQuizPage({
 
                   {/* Lựa chọn đáp án */}
                   <div className="space-y-2.5 pl-0 md:pl-2">
-                    {question.options.map((optText, optIdx) => {
-                      const isSelected = selectedOpt === optIdx;
-                      const isOptionCorrect = isSubmitted && optIdx === question.correct_index;
+                    {(question.shuffledOptions || []).map((opt, optDisplayIdx) => {
+                      const isSelected = selectedOpt === opt.originalIndex;
+                      const isOptionCorrect = isSubmitted && opt.originalIndex === question.correct_index;
                       const isWrongChoice = isSubmitted && isSelected && !isOptionCorrect;
 
                       let rowStyle = 'border-slate-200 hover:border-slate-300 hover:bg-slate-50/70 text-slate-700';
@@ -617,8 +663,8 @@ export default function TakeQuizPage({
 
                       return (
                         <label
-                          key={optIdx}
-                          onClick={() => handleSelectOption(qKey, optIdx)}
+                          key={opt.originalIndex}
+                          onClick={() => handleSelectOption(qKey, opt.originalIndex)}
                           className={`flex items-center gap-3.5 p-3 rounded-xl border transition text-xs select-none ${
                             isSubmitted ? 'cursor-default' : 'cursor-pointer'
                           } ${rowStyle}`}
@@ -626,18 +672,18 @@ export default function TakeQuizPage({
                           <input
                             type="radio"
                             name={`question-${qKey}`}
-                            value={optIdx}
+                            value={opt.originalIndex}
                             checked={isSelected}
                             disabled={isSubmitted}
-                            onChange={() => handleSelectOption(qKey, optIdx)}
+                            onChange={() => handleSelectOption(qKey, opt.originalIndex)}
                             className="sr-only"
                           />
                           <div
                             className={`w-6 h-6 rounded-full border flex items-center justify-center text-[11px] shrink-0 transition ${circleStyle}`}
                           >
-                            {OPTION_LABELS[optIdx] || optIdx + 1}
+                            {OPTION_LABELS[optDisplayIdx] || optDisplayIdx + 1}
                           </div>
-                          <span className="flex-1 leading-relaxed">{optText}</span>
+                          <span className="flex-1 leading-relaxed">{opt.text}</span>
 
                           {isSubmitted && isOptionCorrect && (
                             <span className="text-[11px] font-bold text-emerald-700 bg-emerald-100/80 px-2 py-0.5 rounded-md shrink-0">

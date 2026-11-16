@@ -1391,8 +1391,21 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
               </div>
 
               {quizzes.length === 0 ? (
-                <div className="bg-white border border-dashed border-slate-200 rounded-2xl p-6 text-center">
+                <div className="bg-white border border-dashed border-slate-200 rounded-2xl p-6 text-center space-y-3">
                   <p className="text-slate-400 text-xs">Lớp học chưa có đề kiểm tra trắc nghiệm nào.</p>
+                  {isTeacher && (
+                    <div>
+                      <Link
+                        href={`/classrooms/${classroomId}/create-quiz`}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold rounded-lg shadow-sm transition"
+                      >
+                        <svg className="w-3.5 h-3.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                        </svg>
+                        <span>Tạo đề trắc nghiệm ngay</span>
+                      </Link>
+                    </div>
+                  )}
                 </div>
               ) : (
                 <div className="grid grid-cols-1 gap-3">
@@ -1451,8 +1464,20 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
                               <span>Làm bài kiểm tra</span>
                             </Link>
                           ) : (
-                            <div className="text-xs text-slate-500 font-medium px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg">
-                              Đã phát hành ({duration > 0 ? `${duration} phút` : 'Tự do'})
+                            <div className="flex items-center gap-2">
+                              <div className="text-xs text-slate-500 font-medium px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg">
+                                Đã phát hành ({duration > 0 ? `${duration} phút` : 'Tự do'})
+                              </div>
+                              <Link
+                                href={`/classrooms/${classroomId}/quiz/${quiz.id}`}
+                                className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-semibold rounded-lg border border-indigo-200 transition"
+                              >
+                                <svg className="w-3.5 h-3.5 text-indigo-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                                </svg>
+                                <span>Xem đề</span>
+                              </Link>
                             </div>
                           )}
                         </div>
