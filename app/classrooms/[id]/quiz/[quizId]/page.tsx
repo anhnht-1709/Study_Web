@@ -1,10 +1,8 @@
 'use client';
 
-export const dynamic = 'force-dynamic';
-
-import { useEffect, useState, useCallback, use, useRef } from 'react';
+import { Suspense, useEffect, useState, useCallback, useRef } from 'react';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
+import { useRouter, useParams } from 'next/navigation';
 import { supabase } from '@/lib/supabase';
 
 interface Quiz {
@@ -55,15 +53,11 @@ interface QuizSubmission {
 
 const OPTION_LABELS = ['A', 'B', 'C', 'D', 'E', 'F'];
 
-export default function TakeQuizPage({
-  params,
-}: {
-  params: Promise<{ id: string; quizId: string }>;
-}) {
+function TakeQuizContent() {
   const router = useRouter();
-  const resolvedParams = use(params);
-  const classroomId = resolvedParams.id;
-  const quizId = resolvedParams.quizId;
+  const params = useParams();
+  const classroomId = (params?.id as string) || '';
+  const quizId = (params?.quizId as string) || '';
 
   const [currentUserId, setCurrentUserId] = useState<string>('');
   const [quiz, setQuiz] = useState<Quiz | null>(null);
@@ -778,5 +772,19 @@ export default function TakeQuizPage({
         </div>
       )}
     </div>
+  );
+}
+
+export default function TakeQuizPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="min-h-screen bg-slate-50 flex items-center justify-center">
+          <div className="w-8 h-8 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin"></div>
+        </div>
+      }
+    >
+      <TakeQuizContent />
+    </Suspense>
   );
 }

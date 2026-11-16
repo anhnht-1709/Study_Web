@@ -1,10 +1,8 @@
 'use client';
 
-export const dynamic = 'force-dynamic';
-
-import { useEffect, useState, useCallback, use } from 'react';
+import { Suspense, useEffect, useState, useCallback } from 'react';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
+import { useRouter, useParams } from 'next/navigation';
 import { supabase } from '../../../lib/supabase';
 
 interface Classroom {
@@ -197,9 +195,9 @@ const cleanSubmissionContent = (content?: string): string => {
     .trim();
 };
 
-export default function ClassroomDetailPage({ params }: { params: Promise<{ id: string }> }) {
-  const resolvedParams = use(params);
-  const classroomId = resolvedParams.id;
+function ClassroomDetailContent() {
+  const params = useParams();
+  const classroomId = (params?.id as string) || '';
   const router = useRouter();
 
   const [currentUserId, setCurrentUserId] = useState<string>('');
@@ -2804,5 +2802,19 @@ export default function ClassroomDetailPage({ params }: { params: Promise<{ id: 
         );
       })()}
     </div>
+  );
+}
+
+export default function ClassroomDetailPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="min-h-screen bg-slate-50 flex items-center justify-center">
+          <div className="w-8 h-8 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin"></div>
+        </div>
+      }
+    >
+      <ClassroomDetailContent />
+    </Suspense>
   );
 }

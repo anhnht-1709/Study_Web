@@ -1,9 +1,7 @@
 'use client';
 
-export const dynamic = 'force-dynamic';
-
-import { useState, use } from 'react';
-import { useRouter } from 'next/navigation';
+import { Suspense, useState } from 'react';
+import { useRouter, useParams } from 'next/navigation';
 import { supabase } from '../../../../lib/supabase';
 
 interface QuestionForm {
@@ -12,10 +10,10 @@ interface QuestionForm {
   correct_index: number;
 }
 
-export default function CreateQuizPage({ params }: { params: Promise<{ id: string }> }) {
+function CreateQuizContent() {
   const router = useRouter();
-  const resolvedParams = use(params);
-  const classroomId = resolvedParams.id;
+  const params = useParams();
+  const classroomId = (params?.id as string) || '';
 
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
@@ -263,5 +261,19 @@ export default function CreateQuizPage({ params }: { params: Promise<{ id: strin
         </form>
       </div>
     </div>
+  );
+}
+
+export default function CreateQuizPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="min-h-screen bg-slate-50 flex items-center justify-center">
+          <div className="w-8 h-8 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin"></div>
+        </div>
+      }
+    >
+      <CreateQuizContent />
+    </Suspense>
   );
 }
